@@ -1,4 +1,118 @@
-# Báo cáo Lab: Self evolving Agentic
+"""Rebuild the final report from recorded runs, without calling a model."""
+import json
+import re
+import subprocess
+from pathlib import Path
+
+from lab.compare import ORDER, build_table, load_runs
+from lab.curator import validate_skill
+from lab.tasks import ROOT
+
+
+def git(*args):
+    return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
+
+
+def md_table(headers, rows):
+    return "\n".join([
+        "| " + " | ".join(headers) + " |",
+        "|" + "---|" * len(headers),
+        *("| " + " | ".join(str(v).replace("|", "\\|").replace("\n", " ") for v in row) + " |" for row in rows),
+    ])
+
+
+def main():
+    runs = load_runs(ROOT / "results")
+    assert len(runs) == 18, "Finish all 18 official runs before generating the report."
+    indexed = {(r["condition"], r["task"]): r for r in runs}
+    comparison = build_table(runs)
+    (ROOT / "report/table.md").write_text(comparison + "\n", encoding="utf-8")
+    breakdown = subprocess.check_output(["python", "scripts/check_breakdown.py"], cwd=ROOT, text=True).strip()
+    (ROOT / "report/check_breakdown.txt").write_text(breakdown + "\n", encoding="utf-8")
+    verification = subprocess.check_output(["python", "scripts/verify_freeze.py"], cwd=ROOT, text=True).strip()
+    freeze = git("rev-parse", "freeze")
+    hyp_commit = git("log", "freeze", "--format=%H", "--grep=^hypotheses").splitlines()[0]
+    preregistration = git("show", f"{hyp_commit}:report/REPORT.md")
+    hypotheses = "\n".join(line for line in preregistration.splitlines() if line.startswith(("- H1", "- H2", "- H3")))
+    assert len(hypotheses.splitlines()) == 3
+
+    failure_rows = []
+    for task in ("code-learn", "data-learn", "logs-learn"):
+        for check in indexed["baseline", task]["checks"]:
+            if not check["passed"]:
+                group = "E" if check["name"].startswith("rule_") else "D (kèm dấu hiệu A/B trong vết)"
+                failure_rows.append([task, check["name"], group, check.get("detail", "")])
+    taxonomy = md_table(["Tác vụ", "Check thất bại", "Nhóm", "Bằng chứng từ detail"], failure_rows)
+
+    delegation_rows = []
+    for task in sorted(r["task"] for r in runs if r["condition"] == "subagents"):
+        run = indexed["subagents", task]
+        baseline = indexed["baseline", task]
+        trace = (ROOT / "results/subagents" / task / "trace.md").read_text(encoding="utf-8")
+        names = re.findall(r'"subagent_type":\s*"([^"\n]+)"', trace)
+        delegation_rows.append([task, run["subagent_calls"], ", ".join(names) or "Không thấy tên trong vết", baseline["tokens"]["total"], run["tokens"]["total"], baseline["seconds"], run["seconds"]])
+    delegation = md_table(["Task", "task calls", "Subagent", "Token baseline", "Token subagents", "Giây baseline", "Giây subagents"], delegation_rows)
+
+    skill_rows = []
+    for path in sorted((ROOT / "skills/auto").glob("*/SKILL.md")):
+        text = path.read_text(encoding="utf-8")
+        assert not validate_skill(text, expected_name=path.parent.name)
+        body = text.split("---", 2)[2].strip()
+        if "python" in path.parent.name:
+            judgment = "Tổng quát cho sửa package Python; bao phủ type hints, regression tests và changelog đúng feedback. Điều kiện tối thiểu ba test/bullet chỉ áp dụng khi sửa ba lỗi trở lên có thể bỏ sót quy ước trong tác vụ ít lỗi. Tên file output và heading là quy ước, không phải đáp án."
+            trigger = "Viết/cập nhật package Python; description đúng phạm vi."
+        else:
+            judgment = "Tổng quát cho log nhiều dòng, timezone và repeat; giữ đúng quy ước tên service và schema. 'Immediately follow' có thể gây hiểu sai nếu repeat ở sau traceback. Sơ đồ top-level thiếu counts_by_service dù bước 8 yêu cầu tổng hợp; không buộc dùng parser chương trình."
+            trigger = "Phân tích log với repeat, timestamp và exception; description đủ rộng."
+        skill_rows.append([path.parent.name, judgment, f"{len(text.splitlines())} dòng toàn file / {len(body.splitlines())} dòng body. {trigger}"])
+    skills = md_table(["Skill", "Tính tổng quát và đúng/sai", "Độ dài, description"], skill_rows)
+
+    costs = []
+    stats = {}
+    for condition in ORDER:
+        for role in ("learn", "eval"):
+            selected = [r for r in runs if r["condition"] == condition and r["role"] == role]
+            score = sum(r["score"] for r in selected) / len(selected)
+            tokens = sum(r["tokens"]["total"] for r in selected) / len(selected)
+            seconds = sum(r["seconds"] for r in selected) / len(selected)
+            stats[condition, role] = (score, tokens, seconds)
+            costs.append([condition, role, f"{score:.4f}", f"{tokens:,.1f}", f"{seconds:.1f}", f"{score / tokens * 100000:.3f}"])
+    cost_table = md_table(["Condition", "Role", "Mean score", "Mean tokens", "Mean seconds", "Tổng score / 100k token"], costs)
+
+    noise_rows = []
+    for task in ("code-learn", "data-learn", "logs-learn"):
+        dev = json.loads((ROOT / "results/skills-auto-dev" / task / "run.json").read_text(encoding="utf-8"))
+        official = indexed["skills-auto", task]
+        assert dev["skills_sha256"] == official["skills_sha256"]
+        noise_rows.append([task, f"{dev['passed']}/{dev['total']}", f"{official['passed']}/{official['total']}", f"{official['score'] - dev['score']:+.4f}", dev["tokens"]["total"], official["tokens"]["total"], dev["skills_read"], official["skills_read"]])
+    noise = md_table(["Task", "Phần 3.4", "Sau freeze", "Delta score", "Token dev", "Token chính thức", "Skill read dev", "Skill read chính thức"], noise_rows)
+
+    new_rules = []
+    for family in ("code", "data", "logs"):
+        learned = {c["name"] for c in indexed["baseline", f"{family}-learn"]["checks"]}
+        official = indexed["skills-auto", f"{family}-eval"]
+        for check in official["checks"]:
+            if check["name"].startswith("rule_") and check["name"] not in learned:
+                new_rules.append([official["task"], check["name"], "Đạt" if check["passed"] else "Không đạt", official["skills_read"]])
+    new_rule_table = md_table(["Task đánh giá", "Quy ước mới (tên check)", "skills-auto", "skills_read"], new_rules)
+    errors = [f"{r['condition']}/{r['task']}: {r['error']}" for r in runs if r.get("error")]
+    modified = [f"{r['condition']}/{r['task']}" for r in runs if r["skills_modified"]]
+    skill_read = sum(r["skills_read"] > 0 for r in runs if r["condition"] == "skills-auto")
+    all_records = list((ROOT / "results").rglob("run.json"))
+    api_failures = list((ROOT / "results/infrastructure-api").rglob("run.json"))
+    total_tokens = sum(json.loads(p.read_text(encoding="utf-8"))["tokens"]["total"] for p in all_records)
+    baseline_learn = stats["baseline", "learn"][0]
+    baseline_eval = stats["baseline", "eval"][0]
+    changes = "\n".join(
+        f"- {condition}: mean học {stats[condition, 'learn'][0]:.4f} (delta {stats[condition, 'learn'][0] - baseline_learn:+.4f}), "
+        f"mean đánh giá {stats[condition, 'eval'][0]:.4f} (delta {stats[condition, 'eval'][0] - baseline_eval:+.4f})."
+        for condition in ("subagents", "skills-auto")
+    )
+    best = max(ORDER, key=lambda c: stats[c, "eval"][0] / stats[c, "eval"][1])
+    h1 = stats["subagents", "eval"][0] <= baseline_eval and stats["subagents", "eval"][1] > stats["baseline", "eval"][1]
+    h2 = abs(stats["skills-auto", "eval"][0] - baseline_eval) <= 0.10
+
+    report = f"""# Báo cáo Lab: Self evolving Agentic
 
 ## 1. Thông tin nhóm và cấu hình
 
@@ -8,17 +122,15 @@
 
 Tên/mã lấy từ tên kho và cần đối chiếu trước khi nộp. Mô hình `gpt-4.1-mini`, nhiệt độ 0, recursion limit 60; dùng OpenAI-compatible endpoint qua cấu hình có sẵn của lab.model. Python 3.12.15, Deep Agents 0.7.21, Linux trong Docker Desktop trên Windows/WSL2. Phiên bản đầy đủ: [environment.json](environment.json), [dependencies.txt](dependencies.txt).
 
-29/29 test ngoại tuyến đạt trong Docker. Windows trực tiếp đạt 27/29; hai lỗi do thiếu lệnh Unix, đúng yêu cầu môi trường trong README. Tổng 27 lần chạy task: 18 chính thức, 3 dev với bộ skill cuối, 3 với bộ skill đầu, 2 code bị ảnh hưởng CRLF và 1 lần lỗi kết nối API bị loại. Hai lần gọi curator, một kết nối mô hình nhỏ; ngân sách task không được nêu trong kho. Tổng token task đã ghi: 1,201,108; chưa bao gồm curator và kiểm tra kết nối vì chúng không có usage record. Không giả định ngân sách còn lại hay chi phí tiền.
+29/29 test ngoại tuyến đạt trong Docker. Windows trực tiếp đạt 27/29; hai lỗi do thiếu lệnh Unix, đúng yêu cầu môi trường trong README. Tổng {len(all_records)} lần chạy task: 18 chính thức, 3 dev với bộ skill cuối, 3 với bộ skill đầu, 2 code bị ảnh hưởng CRLF và {len(api_failures)} lần lỗi kết nối API bị loại. Hai lần gọi curator, một kết nối mô hình nhỏ; ngân sách task không được nêu trong kho. Tổng token task đã ghi: {total_tokens:,}; chưa bao gồm curator và kiểm tra kết nối vì chúng không có usage record. Không giả định ngân sách còn lại hay chi phí tiền.
 
-Commit hypotheses: `1d5efecd8c024fab037d75bc42c81e5d5be7c87c`. Tag freeze: `5ebeac37e586dc0865392babb1e89c5afc470ca3`. `.env` bị Git bỏ qua; khóa không xuất hiện trong kết quả/báo cáo. .gitattributes giữ LF cho task và skill để checkout Windows không làm sai hash gốc. Không thay đổi nội dung tệp task/tests/scripts hay các module được cung cấp.
+Commit hypotheses: `{hyp_commit}`. Tag freeze: `{freeze}`. `.env` bị Git bỏ qua; khóa không xuất hiện trong kết quả/báo cáo. .gitattributes giữ LF cho task và skill để checkout Windows không làm sai hash gốc. Không thay đổi nội dung tệp task/tests/scripts hay các module được cung cấp.
 
 ## 2. Giả thuyết (đã commit trước tag freeze)
 
 Các dòng dưới giữ nguyên dự đoán trong commit hypotheses; không điều chỉnh theo kết quả đánh giá.
 
-- H1 (subagents so với baseline): Điểm trung bình đánh giá của subagents không vượt baseline, còn token trung bình cao hơn. Trên tập học, code/logs không cải thiện, data giảm từ 5/8 xuống 0/8 khi tác tử chính chấp nhận số liệu của implementer mà không kiểm chứng. Đây là dự đoán cho cấu hình này, không phải kết luận chung về đa tác tử.
-- H2 (skills-auto so với baseline): Điểm trung bình đánh giá của skills-auto chỉ thay đổi nhỏ so với baseline (chênh lệch tuyệt đối không quá 0,10), còn token có thể tăng. Ba lần chạy với bộ skill đầu tiên đều có skills_read = 0. Sự hiện diện của skill không bảo đảm được đọc và áp dụng. Nghiên cứu SkillsBench v1 ghi nhận skill tự sinh không có lợi trung bình: https://arxiv.org/abs/2602.12670v1.
-- H3 (tác vụ học so với tác vụ đánh giá): Nếu được áp dụng, skill giúp quy ước đã thấy ở tập học nhiều hơn quy ước mới của tập đánh giá; dự đoán các check quy ước mới vẫn có thể thất bại. Không suy diễn kết quả học thành khả năng chuyển giao. SkillEvolBench ghi nhận cải thiện cục bộ thường không ổn định khi thư viện đóng băng: https://arxiv.org/abs/2605.24117.
+{hypotheses}
 
 ## 3. Làm quen Deep Agents
 
@@ -30,22 +142,7 @@ Các dòng dưới giữ nguyên dự đoán trong commit hypotheses; không đi
 
 Chỉ dùng baseline học hợp lệ. Mỗi dòng sau là một check thất bại thực tế; các quy tắc trong detail là phản hồi học, không phải đáp án đánh giá.
 
-| Tác vụ | Check thất bại | Nhóm | Bằng chứng từ detail |
-|---|---|---|---|
-| code-learn | rule_type_hints | E | RULE: every public function (name not starting with '_') in the package has type annotations on all parameters and on the return value. |
-| code-learn | rule_regression_tests | E | RULE: add tests/test_regressions.py with one test function per bug you fixed (at least 3); the file must pass. |
-| code-learn | rule_changelog | E | RULE: record each fix in CHANGELOG.md under the heading '## Unreleased' as a bullet '- fix(<function name>): <short description>' (at least 3 bullets). |
-| data-learn | rule_money_in_cents | E | RULE: money values in answer.json are integer cents (1606.67 USD is written 160667). |
-| data-learn | rule_meta_block | E | RULE: answer.json has an object `meta` = {"source": <input file name>, "rows_in": <number of data rows in the input file, duplicates included>, "rows_used": <number of distinct orders with a known amount>}. |
-| data-learn | rule_clean_csv | E | RULE: write workspace/clean.csv with the header order_id,timestamp_utc,region,amount_cents; one row per distinct order with a known amount; timestamp_utc as YYYY-MM-DDTHH:MM:SSZ (UTC); region in canonical spelling (North, South, East, West); amount in integer cents. |
-| logs-learn | entry_count | D (kèm dấu hiệu A/B trong vết) | wrong number of entries (got 19) |
-| logs-learn | timestamps_utc | D (kèm dấu hiệu A/B trong vết) | 7/25 timestamps match |
-| logs-learn | exception_fields | D (kèm dấu hiệu A/B trong vết) | 18 wrong `exception` values |
-| logs-learn | repeat_counts | D (kèm dấu hiệu A/B trong vết) | 18 wrong `repeat_count` values |
-| logs-learn | counts_by_service | D (kèm dấu hiệu A/B trong vết) | counts_by_service: wrong values |
-| logs-learn | rule_service_names | E | RULE: service names in the output are lower-case with '-' replaced by '_' (payment-service -> payment_service). |
-| logs-learn | rule_sorted_errors | E | RULE: `errors` is sorted by service, then by timestamp_utc, ascending. |
-| logs-learn | rule_schema_header | E | RULE: the top-level object has "schema_version": 2 and "generated_by": "log-triage". |
+{taxonomy}
 
 Nhóm E chiếm 9/14 check thất bại (64,3%). Năm lỗi kỹ thuật còn lại thuộc logs, có dấu hiệu A/B đi kèm: vết baseline logs không đọc README và không chạy parser/test, viết trực tiếp JSON bằng write_file; timestamp offset bị viết thành Z mà không chuyển đúng giờ, thiếu bản ghi và sai traceback/repeat. Skill có thể nhắc quy trình và quy ước, nhưng phải được đọc và thực thi.
 
@@ -57,14 +154,7 @@ Hai code baseline đầu có tests_not_modified thất bại do CRLF checkout, k
 
 Explorer đọc tài liệu/tìm nguyên nhân, implementer thực hiện và kiểm chứng, reviewer kiểm tra độc lập. Description nêu khi nào giao việc, system prompt phân định phạm vi; build_agent nối PATHS_NOTE cho từng subagent.
 
-| Task | task calls | Subagent | Token baseline | Token subagents | Giây baseline | Giây subagents |
-|---|---|---|---|---|---|---|
-| code-eval | 0 | Không thấy tên trong vết | 46746 | 44612 | 20.8 | 19.5 |
-| code-learn | 0 | Không thấy tên trong vết | 51770 | 68621 | 23.3 | 26.6 |
-| data-eval | 1 | general-purpose | 65040 | 25313 | 15.9 | 23.4 |
-| data-learn | 1 | implementer | 46052 | 68335 | 19.0 | 31.7 |
-| logs-eval | 1 | general-purpose | 20849 | 34995 | 6.8 | 25.0 |
-| logs-learn | 0 | Không thấy tên trong vết | 21307 | 25834 | 12.8 | 14.4 |
+{delegation}
 
 Data-learn giao việc cho implementer. Lời giao có chỉ tiêu, sentinel, định dạng ngày và đường dẫn answer.json, nhưng đường dẫn input/README chưa đầy đủ và quy ước Acme chưa thành yêu cầu cụ thể. Tác tử chính nhận báo cáo với các số liệu rồi write_file ngay; không chạy script đối chiếu, cả năm check tính toán sai. Vết chỉ có luồng chính, nên không khẳng định chính xác cách implementer tính bên trong.
 
@@ -76,64 +166,39 @@ Curator chạy hai lần, chỉ đọc role=learn của baseline, bỏ qua run c
 
 Chỉnh prompt curator để giữ chính xác casing/header/schema, phân bổ skill theo họ lỗi và tránh yêu cầu ngoài phạm vi, rồi sinh lại. Không sửa tay SKILL.md. Lần hai có hai skill hợp lệ. Skill data bị validator từ chối vì chứa marker orders, một danh từ chung cũng xuất hiện trong tên file đánh giá: đây có thể là false positive của bộ lọc substring, không chứng minh đọc dữ liệu đánh giá. Không sửa validator. Ba skill lần đầu được chuyển ra ngoài skills/auto, hai skill lần hai được giữ và đóng băng.
 
-| Skill | Tính tổng quát và đúng/sai | Độ dài, description |
-|---|---|---|
-| enforce-python-type-hints-and-regression-tests | Tổng quát cho sửa package Python; bao phủ type hints, regression tests và changelog đúng feedback. Điều kiện tối thiểu ba test/bullet chỉ áp dụng khi sửa ba lỗi trở lên có thể bỏ sót quy ước trong tác vụ ít lỗi. Tên file output và heading là quy ước, không phải đáp án. | 16 dòng toàn file / 12 dòng body. Viết/cập nhật package Python; description đúng phạm vi. |
-| parse-and-structure-logs-with-repeat-counts-and-schema | Tổng quát cho log nhiều dòng, timezone và repeat; giữ đúng quy ước tên service và schema. 'Immediately follow' có thể gây hiểu sai nếu repeat ở sau traceback. Sơ đồ top-level thiếu counts_by_service dù bước 8 yêu cầu tổng hợp; không buộc dùng parser chương trình. | 23 dòng toàn file / 19 dòng body. Phân tích log với repeat, timestamp và exception; description đủ rộng. |
+{skills}
 
-Kết quả Phần 3.4 của bộ cuối: code 7/10, data 2/8, logs 1/9; sao lưu results/skills-auto-dev trước chạy chính thức. Bộ cuối thiếu skill data và không hứa giải quyết mọi lỗi. Trên sáu run chính thức, 0/6 có đọc skill theo định nghĩa read_file ở luồng chính. Xem bảng nhiễu ở mục 8 để đối chiếu với dev.
+Kết quả Phần 3.4 của bộ cuối: code 7/10, data 2/8, logs 1/9; sao lưu results/skills-auto-dev trước chạy chính thức. Bộ cuối thiếu skill data và không hứa giải quyết mọi lỗi. Trên sáu run chính thức, {skill_read}/6 có đọc skill theo định nghĩa read_file ở luồng chính. Xem bảng nhiễu ở mục 8 để đối chiếu với dev.
 
 ## 7. Kết quả so sánh
 
 Bảng dưới do lab.compare sinh từ 18 run.json; bản độc lập ở [table.md](table.md).
 
-| Task | baseline | subagents | skills-auto |
-|---|---|---|---|
-| code-learn | 7/10 | 7/10 | 6/10 |
-| data-learn | 5/8 | 0/8 | 5/8 |
-| logs-learn | 1/9 | 1/9 | 1/9 |
-| code-eval | 7/11 | 7/11 | 7/11 |
-| data-eval | 5/9 | 1/9 | 5/9 |
-| logs-eval | 2/10 | 1/10 | 1/10 |
-| **Mean score - learning tasks** | 0.48 | 0.27 | 0.45 |
-| **Mean score - evaluation tasks** | 0.46 | 0.28 | 0.43 |
-| **Mean tokens per run** | 41,960 | 44,618 | 43,497 |
-| **Runs that read a skill** | 0/6 | 0/6 | 0/6 |
+{comparison}
 
 Phân rã do scripts/check_breakdown.py:
 
 ```text
-condition     role    technical  house rules  mean tokens  read a skill
-baseline      eval     13/18         1/12          44,211      0/3     
-baseline      learn    13/18         0/9           39,709      0/3     
-subagents     eval      9/18         0/12          34,973      0/3     
-subagents     learn     8/18         0/9           54,263      0/3     
-skills-auto   eval     13/18         0/12          44,727      0/3     
-skills-auto   learn    12/18         0/9           42,266      0/3
+{breakdown}
 ```
 
-Lỗi API/harness trong 18 run chính thức: không có. skills_modified=true: không có. Kiểm tra freeze trong Linux: `checked 6 runs of skill conditions: OK`. Hai run CRLF và 1 run lỗi kết nối API được giữ riêng ở results/infrastructure-crlf và results/infrastructure-api, không coi là thất bại tác tử. code-eval/skills-auto có lỗi OpenAIConnectionError với 0 token được chạy lại sau batch, không đổi skill. Mọi run skills-auto chính thức bắt đầu sau freeze, dùng đúng hash skill đã đóng băng.
+Lỗi API/harness trong 18 run chính thức: {', '.join(errors) if errors else 'không có'}. skills_modified=true: {', '.join(modified) if modified else 'không có'}. Kiểm tra freeze trong Linux: `{verification}`. Hai run CRLF và {len(api_failures)} run lỗi kết nối API được giữ riêng ở results/infrastructure-crlf và results/infrastructure-api, không coi là thất bại tác tử. code-eval/skills-auto có lỗi OpenAIConnectionError với 0 token được chạy lại sau batch, không đổi skill. Mọi run skills-auto chính thức bắt đầu sau freeze, dùng đúng hash skill đã đóng băng.
 
 ## 8. Phân tích
 
 ### 8.1. Học và đánh giá
 
-Baseline mean học 0.4787, mean đánh giá 0.4640.
+Baseline mean học {baseline_learn:.4f}, mean đánh giá {baseline_eval:.4f}.
 
-- subagents: mean học 0.2704 (delta -0.2083), mean đánh giá 0.2825 (delta -0.1815).
-- skills-auto: mean học 0.4454 (delta -0.0333), mean đánh giá 0.4306 (delta -0.0333).
+{changes}
 
-H1 không được hỗ trợ đầy đủ với điểm/token đánh giá: điểm subagents thấp hơn, nhưng token đánh giá cũng thấp hơn (34.973 so với 44.211), trái với dự đoán chi phí cao hơn. H2 phù hợp với ngưỡng chênh lệch đã đăng ký: delta đánh giá -0,0333. Không điều kiện nào cải thiện mean học hoặc đánh giá so với baseline; vì vậy không có mẫu cải thiện học nhưng giảm khả năng chuyển giao trong bộ chính thức này. H3 phụ thuộc skill thực sự được áp dụng; không đọc skill nên thí nghiệm chưa kiểm tra cơ chế chuyển giao nội dung, dù cả ba quy ước mới đều không đạt. Không dùng thay đổi nhỏ trên một run để kết luận khả năng tổng quát.
+H1 {'phù hợp' if h1 else 'không được hỗ trợ đầy đủ'} với điểm/token đánh giá: điểm subagents thấp hơn, nhưng token đánh giá cũng thấp hơn (34.973 so với 44.211), trái với dự đoán chi phí cao hơn. H2 {'phù hợp' if h2 else 'không được hỗ trợ'} với ngưỡng chênh lệch đã đăng ký: delta đánh giá -0,0333. Không điều kiện nào cải thiện mean học hoặc đánh giá so với baseline; vì vậy không có mẫu cải thiện học nhưng giảm khả năng chuyển giao trong bộ chính thức này. H3 phụ thuộc skill thực sự được áp dụng; không đọc skill nên thí nghiệm chưa kiểm tra cơ chế chuyển giao nội dung, dù cả ba quy ước mới đều không đạt. Không dùng thay đổi nhỏ trên một run để kết luận khả năng tổng quát.
 
 ### 8.2. Kỹ thuật và quy ước
 
 Dùng breakdown ở mục 7 để tách năng lực tính toán/sửa lỗi khỏi quy ước Acme. Trên tập học, skills-auto đạt 12/18 kỹ thuật so với baseline 13/18, cả hai 0/9 quy ước; mất check csv_quoting_follows_docstring trong code. Trên đánh giá, cả hai 13/18 kỹ thuật, nhưng baseline có 1/12 quy ước (rule_service_names ở logs-eval), còn skills-auto 0/12. Không có lợi ích quan sát được ở nhóm quy ước mà curator nhắm đến. Các check quy ước mới sau đây được xác định bằng tên check đánh giá không có ở họ học tương ứng, chỉ sau freeze:
 
-| Task đánh giá | Quy ước mới (tên check) | skills-auto | skills_read |
-|---|---|---|---|
-| code-eval | rule_version_bump | Không đạt | 0 |
-| data-eval | rule_sorted_keys_format | Không đạt | 0 |
-| logs-eval | rule_source_line | Không đạt | 0 |
+{new_rule_table}
 
 Không suy đoán đáp án hoặc điều kiện chính xác của check ẩn từ tên; feedback đánh giá được để trống theo grading.py. Bộ skill được sinh trước đánh giá và không chứa các định danh mới. Nếu skills_read=0, không thể gán việc đạt hoặc thất bại cho nội dung skill.
 
@@ -143,16 +208,9 @@ Không có đủ bằng chứng để nêu một check được skill giúp đ�
 
 ### 8.4. Chi phí
 
-| Condition | Role | Mean score | Mean tokens | Mean seconds | Tổng score / 100k token |
-|---|---|---|---|---|---|
-| baseline | learn | 0.4787 | 39,709.7 | 18.4 | 1.206 |
-| baseline | eval | 0.4640 | 44,211.7 | 14.5 | 1.049 |
-| subagents | learn | 0.2704 | 54,263.3 | 24.2 | 0.498 |
-| subagents | eval | 0.2825 | 34,973.3 | 22.6 | 0.808 |
-| skills-auto | learn | 0.4454 | 42,266.7 | 53.7 | 1.054 |
-| skills-auto | eval | 0.4306 | 44,727.3 | 42.3 | 0.963 |
+{cost_table}
 
-Chỉ số hiệu suất là tổng điểm task chia tổng token, nhân 100.000; dùng để so sánh trong cùng tập này, không phải đơn vị chất lượng tuyệt đối. baseline có tỷ lệ điểm/token cao nhất trên đánh giá. Với các chênh lệch quan sát được, chưa có bằng chứng rằng chi phí đa tác tử mang lại lợi ích đủ chắc chắn. Điều kiện subagents đồng thời thêm prompt giao việc, nên ảnh hưởng không chỉ đến từ số task call.
+Chỉ số hiệu suất là tổng điểm task chia tổng token, nhân 100.000; dùng để so sánh trong cùng tập này, không phải đơn vị chất lượng tuyệt đối. {best} có tỷ lệ điểm/token cao nhất trên đánh giá. Với các chênh lệch quan sát được, chưa có bằng chứng rằng chi phí đa tác tử mang lại lợi ích đủ chắc chắn. Điều kiện subagents đồng thời thêm prompt giao việc, nên ảnh hưởng không chỉ đến từ số task call.
 
 ### 8.5. Rò rỉ và quá khớp
 
@@ -160,11 +218,7 @@ Không đưa run/trace đánh giá vào curator. Kiểm thử ngoại tuyến th
 
 ### 8.6. Nhiễu cùng bộ skill
 
-| Task | Phần 3.4 | Sau freeze | Delta score | Token dev | Token chính thức | Skill read dev | Skill read chính thức |
-|---|---|---|---|---|---|---|---|
-| code-learn | 7/10 | 6/10 | -0.1000 | 70029 | 64203 | 0 | 0 |
-| data-learn | 2/8 | 5/8 | +0.3750 | 62492 | 34430 | 0 | 0 |
-| logs-learn | 1/9 | 1/9 | +0.0000 | 28113 | 28167 | 0 | 0 |
+{noise}
 
 Hai nhóm chạy dùng cùng hash skill. Code giảm 0,10; data tăng 0,375; logs không đổi. Vết code chính thức bỏ sót CSV quoting; vết data dev có lỗi xử lý offset âm trong parser, trong khi data chính thức đạt lại cả năm chỉ tiêu. Mean học của cùng bộ skill tăng từ 0,3537 ở dev lên 0,4454 (+0,0917); lớn hơn delta skills-auto so với baseline chính thức (-0,0333). Chênh lệch chỉ là hai mẫu dưới cùng cấu hình, không phải ước lượng phương sai đáng tin cậy. Nhiệt độ 0 không bảo đảm lặp lại hoàn toàn; các quyết định đọc file, viết script và xử lý timezone có thể thay đổi. Chênh lệch giữa điều kiện cần được diễn giải thận trọng. Không chọn run tốt nhất thay cho run chính thức.
 
@@ -220,3 +274,10 @@ python report/generate_report.py
 Docker: build bằng Dockerfile được cung cấp (`docker build -t lab-deepagents .`), chạy container với thư mục kho bind mount vào /lab. Cài git trong container bằng apt-get update và apt-get install -y --no-install-recommends git để chạy verify_freeze/check_breakdown. Danh sách package Python đã lưu giúp nhận biết dependency drift. report/generate_report.py chỉ đọc kết quả, giữ nguyên giả thuyết trong Git và sinh lại report/table, không gọi API hay thay skill.
 
 Tài liệu tham khảo: [SkillsBench v1](https://arxiv.org/abs/2602.12670v1) cho nhận xét về skill tự sinh; [SkillEvolBench](https://arxiv.org/abs/2605.24117) cho giới hạn chuyển giao sau đóng băng. Không dùng kết quả nghiên cứu làm số liệu của lab.
+"""
+    (ROOT / "report/REPORT.md").write_text(report, encoding="utf-8")
+    print(f"Generated report from {len(runs)} official runs; {verification}")
+
+
+if __name__ == "__main__":
+    main()
