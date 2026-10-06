@@ -1,0 +1,4 @@
+# The supplied task graders hash original test bytes; preserve LF on Windows.
+tasks/** text eol=lf
+# Preserve generated skill bytes across checkouts for the freeze protocol.
+skills/** text eol=lf

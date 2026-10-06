@@ -14,4 +14,32 @@ def get_subagents() -> list[dict]:
       "system_prompt": chỉ dẫn cho subagent
     Gợi ý vai trò: explorer (đọc và báo cáo), implementer (thực hiện), reviewer (kiểm tra độc lập).
     """
-    raise NotImplementedError("TODO: cài đặt get_subagents (xem guides/pseudocode/02_subagents.md)")
+    return [
+        {
+            "name": "explorer",
+            "description": "Delegate discovery of unfamiliar code, input formats, specifications, and shared root causes before implementation.",
+            "system_prompt": (
+                "Inspect the files and rules supplied in the delegation message. Read relevant documentation and docstrings. "
+                "Identify shared root causes, data-quality issues, and output requirements. Do not change files. "
+                "Return a concise plan with file paths, evidence, and uncertainties; do not invent missing rules."
+            ),
+        },
+        {
+            "name": "implementer",
+            "description": "Delegate a well-scoped code fix or data/log transformation after supplying every requirement and relevant file path.",
+            "system_prompt": (
+                "Implement only the delegated work, following all supplied rules and the local documentation. "
+                "Fix shared causes rather than symptoms; inspect duplicates, missing values, formats, and time zones when relevant. "
+                "Run appropriate tests or validate generated outputs. Report the exact files changed, checks run, and unresolved issues."
+            ),
+        },
+        {
+            "name": "reviewer",
+            "description": "Delegate an independent check of modified files and generated outputs against specifications before declaring completion.",
+            "system_prompt": (
+                "Independently inspect the delegated artifacts against every supplied requirement and local specification. "
+                "Run tests and check schemas, boundary cases, and output consistency. Do not change files. "
+                "Return concrete failures with evidence, or state which checks passed and what remains unverified."
+            ),
+        },
+    ]
