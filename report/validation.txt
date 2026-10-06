@@ -1,0 +1,7 @@
+29 offline tests passed (see pytest.txt).
+18 official results saved; all have error=null and skills_modified=false.
+Freeze verifier: checked 6 runs of skill conditions: OK.
+Comparison table matches lab.compare CLI exactly.
+Protected provided files, constants, and helpers unchanged.
+Task files match original Git bytes exactly.
+No credential-shaped strings in text deliverables.
